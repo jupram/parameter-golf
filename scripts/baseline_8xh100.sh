@@ -25,6 +25,7 @@ apply_env_overrides() {
 
 reset_runtime_env() {
   unset RUN_ID
+  unset SEED
   unset DATA_PATH
   unset TOKENIZER_PATH
   unset VOCAB_SIZE
@@ -56,6 +57,7 @@ fi
 
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export RUN_ID
+export SEED="${SEED:-1337}"
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
@@ -65,6 +67,7 @@ export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-200}"
 
 echo "Running baseline-style training on 8xH100"
 echo "RUN_ID=$RUN_ID"
+echo "SEED=$SEED"
 echo "DATA_PATH=$DATA_PATH"
 echo "TOKENIZER_PATH=$TOKENIZER_PATH"
 echo "VOCAB_SIZE=$VOCAB_SIZE"

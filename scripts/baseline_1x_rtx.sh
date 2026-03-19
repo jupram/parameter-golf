@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eEuo pipefail
+
+on_error() {
+  local exit_code=$?
+  local line_no=$1
+  local command=$2
+  echo "ERROR: command failed at line ${line_no}: ${command}" >&2
+  echo "Exit code: ${exit_code}" >&2
+  if [[ -t 0 ]]; then
+    read -r -p "Press Enter to exit..." _
+  fi
+  exit "${exit_code}"
+}
 
 main() {
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,6 +37,7 @@ apply_env_overrides() {
 
 reset_runtime_env() {
   unset RUN_ID
+  unset SEED
   unset DATA_PATH
   unset TOKENIZER_PATH
   unset VOCAB_SIZE
@@ -57,6 +70,7 @@ if [ ! -f "./data/tokenizers/fineweb_1024_bpe.model" ] || [ ! -f "./data/dataset
 fi
 
 export RUN_ID
+export SEED="${SEED:-42}"
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
@@ -71,6 +85,7 @@ export ENABLE_COMPILE="${ENABLE_COMPILE:-0}"
 
 echo "Running local 1xRTX baseline-style training"
 echo "RUN_ID=$RUN_ID"
+echo "SEED=$SEED"
 echo "DATA_PATH=$DATA_PATH"
 echo "TOKENIZER_PATH=$TOKENIZER_PATH"
 echo "VOCAB_SIZE=$VOCAB_SIZE"
@@ -85,4 +100,6 @@ echo "ENABLE_COMPILE=$ENABLE_COMPILE"
 "$PYTHON" train_gpt.py
 }
 
-( main "$@" )
+trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
+
+main "$@"
