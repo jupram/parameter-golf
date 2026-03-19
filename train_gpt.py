@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import importlib.util
 import io
 import math
 import os
@@ -48,6 +49,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -58,6 +60,8 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    enable_compile = bool(int(os.environ.get("ENABLE_COMPILE", "1")))
+    skip_final_roundtrip_eval = bool(int(os.environ.get("SKIP_FINAL_ROUNDTRIP_EVAL", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -107,6 +111,27 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+
+def can_use_torch_compile() -> bool:
+    return hasattr(torch, "compile") and importlib.util.find_spec("triton") is not None
+
+
+def flash_gqa_supported(device: torch.device) -> bool:
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    q = torch.randn(1, 8, 8, 64, device=device, dtype=torch.bfloat16)
+    k = torch.randn(1, 4, 8, 64, device=device, dtype=torch.bfloat16)
+    v = torch.randn(1, 4, 8, 64, device=device, dtype=torch.bfloat16)
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
+    try:
+        F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=True)
+        return True
+    except RuntimeError:
+        return False
 
 
 class Muon(torch.optim.Optimizer):
@@ -240,6 +265,9 @@ def eval_val(
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    if args.val_max_tokens > 0:
+        max_seqs = max(args.val_max_tokens // args.train_seq_len, 1)
+        total_seqs = min(total_seqs, max_seqs)
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -733,7 +761,9 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    compile_enabled = args.enable_compile and can_use_torch_compile()
+    if compile_enabled:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -754,7 +784,11 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+        init_kwargs = dict(backend=backend)
+        if backend == "nccl":
+            init_kwargs["device_id"] = device
+        dist.init_process_group(**init_kwargs)
         dist.barrier()
     master_process = rank == 0
 
@@ -763,10 +797,11 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
+    use_flash_gqa = flash_gqa_supported(device)
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
+    enable_flash_sdp(use_flash_gqa)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_math_sdp(not use_flash_gqa)
 
     logfile = None
     if master_process:
@@ -792,6 +827,9 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+    log0(f"torch_compile_enabled:{compile_enabled}")
+    if distributed:
+        log0(f"distributed_backend:{dist.get_backend()}")
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -840,7 +878,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if compile_enabled else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -895,7 +933,9 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(
+        f"sdp_backends:cudnn=False flash={use_flash_gqa} mem_efficient=False math={not use_flash_gqa}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -907,6 +947,8 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.val_max_tokens > 0:
+        log0(f"val_max_tokens:{args.val_max_tokens}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1091,32 +1133,35 @@ def main() -> None:
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
-    if distributed:
-        dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.skip_final_roundtrip_eval:
+        log0("final_int8_zlib_roundtrip:skipped")
+    else:
+        if distributed:
+            dist.barrier()
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
