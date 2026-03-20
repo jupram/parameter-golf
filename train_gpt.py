@@ -541,6 +541,57 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class LowerTriangularLinear(nn.Module):
+    # Store only the lower-triangular entries in fp32, materialize a dense matrix at matmul time.
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        lower_rows, lower_cols = torch.tril_indices(out_features, in_features, offset=0, device=device)
+        self.register_buffer("_lower_rows", lower_rows, persistent=False)
+        self.register_buffer("_lower_cols", lower_cols, persistent=False)
+        self.packed_weight = nn.Parameter(torch.empty(lower_rows.numel(), device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        dense_weight = torch.empty(
+            self.out_features,
+            self.in_features,
+            device=self.packed_weight.device,
+            dtype=self.packed_weight.dtype,
+        )
+        nn.init.kaiming_uniform_(dense_weight, a=math.sqrt(5))
+        with torch.no_grad():
+            self.packed_weight.copy_(dense_weight[self._lower_rows, self._lower_cols])
+        if self.bias is not None:
+            bound = 1 / math.sqrt(self.in_features) if self.in_features > 0 else 0.0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    @property
+    def weight(self) -> Tensor:
+        weight = self.packed_weight.new_zeros((self.out_features, self.in_features))
+        weight[self._lower_rows, self._lower_cols] = self.packed_weight
+        return weight
+
+    def forward(self, x: Tensor) -> Tensor:
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), bias)
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -699,6 +750,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.triangular = LowerTriangularLinear(model_dim, model_dim, bias=False)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -724,9 +776,12 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            if isinstance(module, LowerTriangularLinear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.packed_weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        x = self.triangular(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -875,7 +930,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, LowerTriangularLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if compile_enabled else base_model
@@ -885,17 +940,22 @@ def main() -> None:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - packed lower-triangular params use MATRIX_LR via Adam (Muon expects 2D tensors)
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    packed_matrix_params = [p for name, p in block_named_params if name.endswith("packed_weight")]
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2
+        and not name.endswith("packed_weight")
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 and not name.endswith("packed_weight"))
+        or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -921,6 +981,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if packed_matrix_params:
+        optimizer_packed_matrix = torch.optim.Adam(
+            [{"params": packed_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(2, optimizer_packed_matrix)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
