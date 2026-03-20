@@ -51,6 +51,7 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    log_edit_stats = bool(int(os.environ.get("LOG_EDIT_STATS", "0")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -70,17 +71,18 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "0")))
+    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    edit_state_hidden = int(os.environ.get("EDIT_STATE_HIDDEN", 2 * model_dim))
-    binary_logit_hidden = int(os.environ.get("BINARY_LOGIT_HIDDEN", model_dim))
+    edit_logit_rank = int(os.environ.get("EDIT_LOGIT_RANK", model_dim // 4))
+    binary_logit_hidden = int(os.environ.get("BINARY_LOGIT_HIDDEN", 64))
     edit_injection_scale = float(os.environ.get("EDIT_INJECTION_SCALE", 0.2))
     aux_loss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", 0.2))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
+    aux_lr = float(os.environ.get("AUX_LR", 0.005))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
@@ -231,40 +233,6 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
-
-
-def _has_whitespace(text: str) -> bool:
-    return any(ch.isspace() for ch in text)
-
-
-def build_token_has_whitespace_label(tokenizer) -> Tensor:
-    """
-    Build a (vocab_size,) table where:
-    - 1: token decode contains at least one whitespace character
-    - 0: token decode has no whitespace character
-    """
-    vocab_size_attr = getattr(tokenizer, "vocab_size", None)
-    vocab_size = int(vocab_size_attr() if callable(vocab_size_attr) else vocab_size_attr)
-    if hasattr(tokenizer, "batch_decode"):
-        pieces = tokenizer.batch_decode(
-            [[token_id] for token_id in range(vocab_size)],
-            clean_up_tokenization_spaces=False,
-        )
-    else:
-        pieces = []
-        for token_id in range(vocab_size):
-            if hasattr(tokenizer, "decode"):
-                try:
-                    piece = tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
-                except TypeError:
-                    piece = tokenizer.decode([token_id])
-            elif hasattr(tokenizer, "id_to_piece"):
-                piece = tokenizer.id_to_piece(token_id)
-            else:
-                raise TypeError("tokenizer must support batch_decode, decode, or id_to_piece")
-            pieces.append(piece)
-    return torch.tensor([int(_has_whitespace(piece)) for piece in pieces], dtype=torch.long)
-
 
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
@@ -671,12 +639,13 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, *, zero_init_proj: bool = True):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        if zero_init_proj:
+            self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -710,6 +679,25 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
+class EditStateCreator(nn.Module):
+    def __init__(self, model_dim: int):
+        super().__init__()
+        self.mlp = MLP(model_dim, 2, zero_init_proj=False)
+        
+    def forward(self, x0: Tensor) -> Tensor:
+        return self.mlp(x0)
+
+
+class LowRankLogits(nn.Module):
+    def __init__(self, model_dim: int, vocab_size: int, rank: int):
+        super().__init__()
+        self.down = CastedLinear(model_dim, rank, bias=False)
+        self.norm = RMSNorm()
+        self.up = CastedLinear(rank, vocab_size, bias=False)
+        self.up._zero_init = True
+
+    def forward(self, edit_state: Tensor) -> Tensor:
+        return self.up(self.norm(self.down(edit_state)))
 
 class GPT(nn.Module):
     def __init__(
@@ -725,7 +713,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        edit_state_hidden: int,
+        edit_logit_rank: int,
         binary_logit_hidden: int,
         edit_injection_scale: float,
         aux_loss_weight: float,
@@ -733,8 +721,8 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if edit_state_hidden <= 0:
-            raise ValueError(f"edit_state_hidden must be positive, got {edit_state_hidden}")
+        if edit_logit_rank <= 0:
+            raise ValueError(f"edit_logit_rank must be positive, got {edit_logit_rank}")
         if binary_logit_hidden <= 0:
             raise ValueError(f"binary_logit_hidden must be positive, got {binary_logit_hidden}")
         self.tie_embeddings = tie_embeddings
@@ -761,16 +749,16 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self.edit_state_creator_mlp = nn.Sequential(
-            CastedLinear(model_dim, edit_state_hidden),
-            nn.SiLU(),
-            CastedLinear(edit_state_hidden, model_dim),
-        )
+        self.edit_state_creator_mlp = EditStateCreator(model_dim)
+        self.edit_state_norm = RMSNorm()
+        self.edit_logit_proj = LowRankLogits(model_dim, vocab_size, edit_logit_rank)
+
         self.binary_logit_creator_mlp = nn.Sequential(
             CastedLinear(model_dim, binary_logit_hidden),
             nn.SiLU(),
             CastedLinear(binary_logit_hidden, 1),
         )
+
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -782,6 +770,28 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def _compute_edit_branch(self, x0: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        edit_state_raw = self.edit_state_creator_mlp(x0)
+        edit_state = self.edit_state_norm(edit_state_raw)
+        edit_logits = self.edit_logit_proj(edit_state)
+        return edit_state_raw, edit_state, edit_logits
+
+    def edit_diagnostics(self, input_ids: Tensor) -> dict[str, float]:
+        x0 = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
+        edit_state_raw, edit_state, edit_logits = self._compute_edit_branch(x0)
+
+        def rms(x: Tensor) -> float:
+            return float(torch.sqrt(torch.mean(x.float().square())).item())
+
+        return {
+            "edit_state_raw_rms": rms(edit_state_raw),
+            "edit_state_raw_absmax": float(edit_state_raw.float().abs().max().item()),
+            "edit_state_rms": rms(edit_state),
+            "edit_state_absmax": float(edit_state.float().abs().max().item()),
+            "edit_logits_std": float(edit_logits.float().std().item()),
+            "edit_logits_absmax": float(edit_logits.float().abs().max().item()),
+        }
 
     def forward(
         self,
@@ -811,11 +821,8 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(z)
-        edit_state = self.edit_state_creator_mlp(x0)
-        # The edit path intentionally reuses the token embedding matrix even when the
-        # main LM head is untied.
-        edit_logits = F.linear(edit_state, self.tok_emb.weight)
-        logits = (logits_proj + self.edit_injection_scale * torch.tanh(edit_logits)).reshape(-1, self.tok_emb.num_embeddings)
+        _, edit_state, edit_logits = self._compute_edit_branch(x0)
+        logits = (logits_proj + self.edit_injection_scale * edit_logits).reshape(-1, self.tok_emb.num_embeddings)
         ce_loss = F.cross_entropy(
             self.logit_softcap * torch.tanh(logits / self.logit_softcap).float(),
             targets,
@@ -933,7 +940,6 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    token_has_whitespace_lut = build_token_has_whitespace_label(sp).to(device=device)
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -954,7 +960,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        edit_state_hidden=args.edit_state_hidden,
+        edit_logit_rank=args.edit_logit_rank,
         binary_logit_hidden=args.binary_logit_hidden,
         edit_injection_scale=args.edit_injection_scale,
         aux_loss_weight=args.aux_loss_weight,
@@ -969,6 +975,7 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
+    # - aux network (Adam) uses AUX_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
@@ -984,9 +991,11 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    aux_params = list(base_model.edit_state_creator_mlp.parameters()) + list(base_model.binary_logit_creator_mlp.parameters())
-    matrix_params.extend(p for p in aux_params if p.ndim == 2)
-    scalar_params.extend(p for p in aux_params if p.ndim < 2)
+    aux_params = (
+        list(base_model.edit_state_creator_mlp.parameters())
+        + list(base_model.edit_logit_proj.parameters())
+        + list(base_model.binary_logit_creator_mlp.parameters())
+    )
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1008,7 +1017,13 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_aux = torch.optim.Adam(
+        [{"params": aux_params, "lr": args.aux_lr, "base_lr": args.aux_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_aux]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1028,11 +1043,11 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"aux_lr:{args.aux_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"aux_loss_weight:{args.aux_loss_weight} edit_injection_scale:{args.edit_injection_scale} "
-        f"edit_state_hidden:{args.edit_state_hidden} binary_logit_hidden:{args.binary_logit_hidden}"
+        f"edit_logit_rank:{args.edit_logit_rank} binary_logit_hidden:{args.binary_logit_hidden}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1078,7 +1093,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                binary_targets = token_has_whitespace_lut[y]
+                binary_targets = has_leading_space_lut[y]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y, binary_targets)
                 (warmup_loss * grad_scale).backward()
@@ -1147,7 +1162,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            binary_targets = token_has_whitespace_lut[y]
+            binary_targets = has_leading_space_lut[y]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y, binary_targets)
             train_loss += loss.detach()
@@ -1180,6 +1195,18 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if args.log_edit_stats:
+                with torch.inference_mode():
+                    edit_stats = base_model.edit_diagnostics(x)
+                log0(
+                    "edit_stats:"
+                    f" raw_rms:{edit_stats['edit_state_raw_rms']:.4f}"
+                    f" raw_absmax:{edit_stats['edit_state_raw_absmax']:.4f}"
+                    f" norm_rms:{edit_stats['edit_state_rms']:.4f}"
+                    f" norm_absmax:{edit_stats['edit_state_absmax']:.4f}"
+                    f" logits_std:{edit_stats['edit_logits_std']:.4f}"
+                    f" logits_absmax:{edit_stats['edit_logits_absmax']:.4f}"
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
