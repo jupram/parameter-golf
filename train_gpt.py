@@ -51,7 +51,7 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    log_edit_stats = bool(int(os.environ.get("LOG_EDIT_STATS", "0")))
+    log_edit_stats = bool(int(os.environ.get("LOG_EDIT_STATS", "1")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -76,7 +76,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     edit_logit_rank = int(os.environ.get("EDIT_LOGIT_RANK", model_dim // 4))
     binary_logit_hidden = int(os.environ.get("BINARY_LOGIT_HIDDEN", 64))
-    edit_injection_scale = float(os.environ.get("EDIT_INJECTION_SCALE", 0.2))
+    edit_injection_scale = float(os.environ.get("EDIT_INJECTION_SCALE", 0.1))
     aux_loss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", 0.2))
 
     # Optimizer hyperparameters.
@@ -210,11 +210,12 @@ class Muon(torch.optim.Optimizer):
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
     base_bytes_np = np.zeros((table_size,), dtype=np.int16)
     has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_word_start_np = np.zeros((table_size,), dtype=np.bool_)
     is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
     for token_id in range(sp_vocab_size):
         if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
@@ -226,11 +227,13 @@ def build_sentencepiece_luts(
         piece = sp.id_to_piece(token_id)
         if piece.startswith("▁"):
             has_leading_space_np[token_id] = True
+            is_word_start_np[token_id] = True
             piece = piece[1:]
         base_bytes_np[token_id] = len(piece.encode("utf-8"))
     return (
         torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_word_start_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
@@ -937,7 +940,7 @@ def main() -> None:
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+    base_bytes_lut, has_leading_space_lut, is_word_start_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
@@ -1093,7 +1096,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                binary_targets = has_leading_space_lut[y]
+                binary_targets = is_word_start_lut[y]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y, binary_targets)
                 (warmup_loss * grad_scale).backward()
@@ -1162,7 +1165,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            binary_targets = has_leading_space_lut[y]
+            binary_targets = is_word_start_lut[y]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y, binary_targets)
             train_loss += loss.detach()
