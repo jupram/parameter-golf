@@ -51,7 +51,6 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    log_edit_stats = bool(int(os.environ.get("LOG_EDIT_STATS", "1")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -74,10 +73,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    edit_logit_rank = int(os.environ.get("EDIT_LOGIT_RANK", model_dim // 4))
     binary_logit_hidden = int(os.environ.get("BINARY_LOGIT_HIDDEN", 64))
-    edit_injection_scale = float(os.environ.get("EDIT_INJECTION_SCALE", 0.1))
-    aux_loss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", 0.2))
+    edit_injection_scale = float(os.environ.get("EDIT_INJECTION_SCALE", 0.08))
+    aux_loss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", 0.1))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -210,12 +208,11 @@ class Muon(torch.optim.Optimizer):
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
     base_bytes_np = np.zeros((table_size,), dtype=np.int16)
     has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
-    is_word_start_np = np.zeros((table_size,), dtype=np.bool_)
     is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
     for token_id in range(sp_vocab_size):
         if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
@@ -227,13 +224,11 @@ def build_sentencepiece_luts(
         piece = sp.id_to_piece(token_id)
         if piece.startswith("▁"):
             has_leading_space_np[token_id] = True
-            is_word_start_np[token_id] = True
             piece = piece[1:]
         base_bytes_np[token_id] = len(piece.encode("utf-8"))
     return (
         torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
-        torch.tensor(is_word_start_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
@@ -550,6 +545,57 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class LowerTriangularLinear(nn.Module):
+    # Store only the lower-triangular entries in fp32, materialize a dense matrix at matmul time.
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        lower_rows, lower_cols = torch.tril_indices(out_features, in_features, offset=0, device=device)
+        self.register_buffer("_lower_rows", lower_rows, persistent=False)
+        self.register_buffer("_lower_cols", lower_cols, persistent=False)
+        self.packed_weight = nn.Parameter(torch.empty(lower_rows.numel(), device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        dense_weight = torch.empty(
+            self.out_features,
+            self.in_features,
+            device=self.packed_weight.device,
+            dtype=self.packed_weight.dtype,
+        )
+        nn.init.kaiming_uniform_(dense_weight, a=math.sqrt(5))
+        with torch.no_grad():
+            self.packed_weight.copy_(dense_weight[self._lower_rows, self._lower_cols])
+        if self.bias is not None:
+            bound = 1 / math.sqrt(self.in_features) if self.in_features > 0 else 0.0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    @property
+    def weight(self) -> Tensor:
+        weight = self.packed_weight.new_zeros((self.out_features, self.in_features))
+        weight[self._lower_rows, self._lower_cols] = self.packed_weight
+        return weight
+
+    def forward(self, x: Tensor) -> Tensor:
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), bias)
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -687,20 +733,9 @@ class EditStateCreator(nn.Module):
         super().__init__()
         self.mlp = MLP(model_dim, 2, zero_init_proj=False)
         
-    def forward(self, x0: Tensor) -> Tensor:
-        return self.mlp(x0)
+    def forward(self, z: Tensor) -> Tensor:
+        return self.mlp(z)
 
-
-class LowRankLogits(nn.Module):
-    def __init__(self, model_dim: int, vocab_size: int, rank: int):
-        super().__init__()
-        self.down = CastedLinear(model_dim, rank, bias=False)
-        self.norm = RMSNorm()
-        self.up = CastedLinear(rank, vocab_size, bias=False)
-        self.up._zero_init = True
-
-    def forward(self, edit_state: Tensor) -> Tensor:
-        return self.up(self.norm(self.down(edit_state)))
 
 class GPT(nn.Module):
     def __init__(
@@ -716,7 +751,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        edit_logit_rank: int,
         binary_logit_hidden: int,
         edit_injection_scale: float,
         aux_loss_weight: float,
@@ -724,8 +758,6 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if edit_logit_rank <= 0:
-            raise ValueError(f"edit_logit_rank must be positive, got {edit_logit_rank}")
         if binary_logit_hidden <= 0:
             raise ValueError(f"binary_logit_hidden must be positive, got {binary_logit_hidden}")
         self.tie_embeddings = tie_embeddings
@@ -738,6 +770,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.triangular = LowerTriangularLinear(model_dim, model_dim, bias=False)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -754,9 +787,10 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm()
         self.edit_state_creator_mlp = EditStateCreator(model_dim)
         self.edit_state_norm = RMSNorm()
-        self.edit_logit_proj = LowRankLogits(model_dim, vocab_size, edit_logit_rank)
+        self.edit_gate_proj = CastedLinear(model_dim, 1)
+        self.edit_gate_proj._zero_init = True
 
-        self.binary_logit_creator_mlp = nn.Sequential(
+        self.space_logit_creator_mlp = nn.Sequential(
             CastedLinear(model_dim, binary_logit_hidden),
             nn.SiLU(),
             CastedLinear(binary_logit_hidden, 1),
@@ -773,38 +807,11 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
-    def _compute_edit_branch(self, x0: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        edit_state_raw = self.edit_state_creator_mlp(x0)
-        edit_state = self.edit_state_norm(edit_state_raw)
-        edit_logits = self.edit_logit_proj(edit_state)
-        return edit_state_raw, edit_state, edit_logits
-
-    def edit_diagnostics(self, input_ids: Tensor) -> dict[str, float]:
-        x0 = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
-        edit_state_raw, edit_state, edit_logits = self._compute_edit_branch(x0)
-
-        def rms(x: Tensor) -> float:
-            return float(torch.sqrt(torch.mean(x.float().square())).item())
-
-        return {
-            "edit_state_raw_rms": rms(edit_state_raw),
-            "edit_state_raw_absmax": float(edit_state_raw.float().abs().max().item()),
-            "edit_state_rms": rms(edit_state),
-            "edit_state_absmax": float(edit_state.float().abs().max().item()),
-            "edit_logits_std": float(edit_logits.float().std().item()),
-            "edit_logits_absmax": float(edit_logits.float().abs().max().item()),
-        }
-
-    def forward(
-        self,
-        input_ids: Tensor,
-        target_ids: Tensor,
-        binary_targets: Tensor | None = None,
-    ) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+    def _run_backbone(self, x0: Tensor) -> Tensor:
+        x = x0
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
@@ -815,30 +822,51 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
 
-        z = self.final_norm(x)
+    def _compute_edit_branch(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        edit_state_raw = self.edit_state_creator_mlp(z)
+        edit_state = self.edit_state_norm(edit_state_raw)
+        edit_gate = torch.sigmoid(self.edit_gate_proj(z))
+        return edit_state_raw, edit_state, edit_gate
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        space_targets: Tensor | None = None,
+    ) -> Tensor:
+        x0 = self.tok_emb(input_ids)
+        x = self.triangular(x0)
+        x = F.rms_norm(x, (x.size(-1),))
+        
+        z = self._run_backbone(x)
+        _, edit_state, edit_gate = self._compute_edit_branch(x0)
+        z = z + self.edit_injection_scale * edit_gate * edit_state
+
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(z, self.tok_emb.weight)
+            logits = F.linear(z, self.tok_emb.weight).reshape(-1, self.tok_emb.num_embeddings)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(z)
-        _, edit_state, edit_logits = self._compute_edit_branch(x0)
-        logits = (logits_proj + self.edit_injection_scale * edit_logits).reshape(-1, self.tok_emb.num_embeddings)
+            logits = self.lm_head(z).reshape(-1, self.tok_emb.num_embeddings)
+        
         ce_loss = F.cross_entropy(
             self.logit_softcap * torch.tanh(logits / self.logit_softcap).float(),
             targets,
             reduction="mean",
         )
-        if self.training and binary_targets is not None:
-            binary_logits = self.binary_logit_creator_mlp(edit_state).reshape(-1)
+        
+        if self.training and space_targets is not None:
+            space_logits = self.space_logit_creator_mlp(edit_state).reshape(-1)
             binary_loss = F.binary_cross_entropy_with_logits(
-                binary_logits.float(),
-                binary_targets.reshape(-1).float(),
+                space_logits.float(),
+                space_targets.reshape(-1).float(),
                 reduction="mean",
             )
             return ce_loss + self.aux_loss_weight * binary_loss
+        
         return ce_loss
 
 
@@ -940,7 +968,7 @@ def main() -> None:
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_word_start_lut, is_boundary_token_lut = build_sentencepiece_luts(
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
@@ -963,13 +991,12 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        edit_logit_rank=args.edit_logit_rank,
         binary_logit_hidden=args.binary_logit_hidden,
         edit_injection_scale=args.edit_injection_scale,
         aux_loss_weight=args.aux_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, LowerTriangularLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if compile_enabled else base_model
@@ -980,7 +1007,9 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - aux network (Adam) uses AUX_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - packed lower-triangular params use MATRIX_LR via Adam because Muon expects 2D tensors
     # - vectors/scalars use SCALAR_LR via Adam
+    packed_matrix_params = [p for name, p in base_model.named_parameters() if name.endswith("packed_weight")]
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -996,8 +1025,8 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     aux_params = (
         list(base_model.edit_state_creator_mlp.parameters())
-        + list(base_model.edit_logit_proj.parameters())
-        + list(base_model.binary_logit_creator_mlp.parameters())
+        + list(base_model.edit_gate_proj.parameters())
+        + list(base_model.space_logit_creator_mlp.parameters())
     )
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1027,6 +1056,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_aux]
+    if packed_matrix_params:
+        optimizer_packed_matrix = torch.optim.Adam(
+            [{"params": packed_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(2, optimizer_packed_matrix)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1050,7 +1087,7 @@ def main() -> None:
     )
     log0(
         f"aux_loss_weight:{args.aux_loss_weight} edit_injection_scale:{args.edit_injection_scale} "
-        f"edit_logit_rank:{args.edit_logit_rank} binary_logit_hidden:{args.binary_logit_hidden}"
+        f"binary_logit_hidden:{args.binary_logit_hidden}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1096,9 +1133,9 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                binary_targets = is_word_start_lut[y]
+                space_targets = has_leading_space_lut[y]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y, binary_targets)
+                    warmup_loss = model(x, y, space_targets)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1165,9 +1202,9 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            binary_targets = is_word_start_lut[y]
+            space_targets = has_leading_space_lut[y]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, binary_targets)
+                loss = model(x, y, space_targets)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1198,19 +1235,6 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if args.log_edit_stats:
-                with torch.inference_mode():
-                    edit_stats = base_model.edit_diagnostics(x)
-                log0(
-                    "edit_stats:"
-                    f" raw_rms:{edit_stats['edit_state_raw_rms']:.4f}"
-                    f" raw_absmax:{edit_stats['edit_state_raw_absmax']:.4f}"
-                    f" norm_rms:{edit_stats['edit_state_rms']:.4f}"
-                    f" norm_absmax:{edit_stats['edit_state_absmax']:.4f}"
-                    f" logits_std:{edit_stats['edit_logits_std']:.4f}"
-                    f" logits_absmax:{edit_stats['edit_logits_absmax']:.4f}"
-                )
-
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:

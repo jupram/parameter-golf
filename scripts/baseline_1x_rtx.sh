@@ -70,7 +70,7 @@ if [ ! -f "./data/tokenizers/fineweb_1024_bpe.model" ] || [ ! -f "./data/dataset
 fi
 
 export RUN_ID
-export SEED="${SEED:-42}"
+export SEED="${SEED:-1142}"
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
