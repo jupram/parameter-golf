@@ -284,7 +284,8 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss, _ = model(x, y)
+                batch_loss = batch_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -779,7 +780,7 @@ class GPT(nn.Module):
             if isinstance(module, LowerTriangularLinear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.packed_weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = self.triangular(x)
         x = F.rms_norm(x, (x.size(-1),))
@@ -795,8 +796,8 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
+        targets = target_ids
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -804,8 +805,35 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction="mean")
+        return ce_loss, ce_k_loss(logits, targets)
 
+def ce_k_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 5.0) -> torch.Tensor:
+    B, T, V = logits.shape
+    losses = F.cross_entropy(
+        logits.view(-1, V),
+        targets.view(-1),
+        reduction="none",
+    )
+    # per-token losses (B, T)
+    per_token_losses = losses.view(B, T)
+    # Apply weights per time step before reducing
+    with torch.no_grad():
+        weights = make_weights(T, 0.5, p=1.2, device=losses.device, dtype=losses.dtype)
+    
+    weighted_losses = per_token_losses * weights
+    per_sample_losses = weighted_losses.mean(dim=1)
+    return per_sample_losses.mean()
+
+def make_weights(T: int, c: float, p: float, device=None, dtype=torch.float32):
+    assert T >= 2, "Need T>=2 so (T-1) is nonzero."
+    assert c > 0, "c must be > 0."
+    #assert p > 1, "p must be > 1 for 'more mass later' convex increase."
+    i = torch.arange(1, T + 1, device=device, dtype=dtype)  # 1..T
+    x = (i - 1) / (T - 1)                                   # 0..1
+    w = c + (1 - c) * (x ** p)
+    #return w  # shape: (T,)
+    return w.flip(0)  # shape: (T,)
 
 # -----------------------------
 # TRAINING
@@ -1055,8 +1083,8 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
-                (warmup_loss * grad_scale).backward()
+                    _, warmup_ce_k_loss = model(x, y)
+                (warmup_ce_k_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -1123,9 +1151,9 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
+                ce_loss, ce_k = model(x, y)
+            train_loss += ce_loss.detach()
+            (ce_k * grad_scale).backward()
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
