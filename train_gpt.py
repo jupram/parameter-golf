@@ -547,7 +547,7 @@ class LowerTriangularLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        bias: bool = True,
+        bias: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -942,7 +942,7 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - packed lower-triangular params use MATRIX_LR via Adam (Muon expects 2D tensors)
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters()) + list(base_model.triangular.named_parameters())
     packed_matrix_params = [p for name, p in block_named_params if name.endswith("packed_weight")]
     matrix_params = [
         p
