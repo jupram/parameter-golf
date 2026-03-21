@@ -1,0 +1,17 @@
+{
+  "author": "jupram",
+  "github_id": "jupram",
+  "name": "Baseline SP1024 1xH100 Shear",
+  "blurb": "Single-H100 10-minute track: SP-1024 9x512 KV4 baseline using the current train_gpt.py and published fineweb10B_sp1024 export; final int8+zlib roundtrip scored 1.3416 BPB under the 16,000,000-byte cap.",
+  "date": "2026-03-21T07:23:24Z",
+  "track": "track_10min_1xh100_shear",
+  "val_loss": 2.26517979,
+  "val_bpb": 1.34156706,
+  "pre_quant_val_loss": 2.2625,
+  "pre_quant_val_bpb": 1.34,
+  "step_stop": 1146,
+  "wallclock_seconds": 600.417,
+  "bytes_total": 13075284,
+  "bytes_model_int8_zlib": 13022501,
+  "bytes_code": 52783
+}
