@@ -318,7 +318,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,final_resid_mix,final_resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -752,6 +752,9 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.triangular = LowerTriangularLinear(model_dim, model_dim, bias=False)
+
+        self.final_resid_mix = nn.Parameter(torch.stack((torch.ones(model_dim), torch.zeros(model_dim))).float())
+
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -796,6 +799,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
+        x = self.final_resid_mix[0][None, None, :] * x + self.final_resid_mix[1][None, None, :] * x0
         x = self.final_norm(x)
         targets = target_ids
         if self.tie_embeddings:
@@ -970,23 +974,25 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - packed lower-triangular params use MATRIX_LR via Adam (Muon expects 2D tensors)
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters()) + list(base_model.triangular.named_parameters())
-    packed_matrix_params = [p for name, p in block_named_params if name.endswith("packed_weight")]
+    optim_named_params = (
+        list(base_model.blocks.named_parameters())
+        + list(base_model.triangular.named_parameters())
+        + list(base_model.named_parameters(recurse=False))
+    )
+    packed_matrix_params = [p for name, p in optim_named_params if name.endswith("packed_weight")]
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in optim_named_params
         if p.ndim == 2
         and not name.endswith("packed_weight")
         and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in optim_named_params
         if (p.ndim < 2 and not name.endswith("packed_weight"))
         or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
