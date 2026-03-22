@@ -2,7 +2,7 @@
 
 This is a non-record submission, and the result is slightly worse than the published naive baseline. The experiment tests a specific hypothesis: a very small auxiliary network, running alongside the main LM, may be able to learn simple but high-value structure faster than the trunk and feed that information back as a cheap correction. Instead of making the base model larger, the goal is to see whether a tiny side network can learn an prior and use it to nudge next-token prediction in the right direction.
 
-This idea was motivated by earlier small-LM experiments on TinyStories with an RTX 5090. Even when the over LM did not produce a clear validation-loss improvement, the generated stories were more coherent and more interesting qualitatively.
+This idea was motivated by earlier small-LM experiments on TinyStories with an RTX 5090. Even when the model did not show a clear improvement in validation loss, the generated stories were often more coherent and more interesting qualitatively. That suggests a useful insight: since, the standard LM architectures are hyper optimized, when testing non-standard LM architectures, it is worth looking beyond aggregate train/val metrics, because some behavioral differences may show up more clearly in qualitative evaluation than in loss alone.
 
 In this particular submission, we use the aux network to predict whether the next-token contains a space character or not. The aux network tries in two coupled ways:
 
