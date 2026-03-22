@@ -284,7 +284,9 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, _ = model(x, y)
+                batch_loss, _ = model(x, y, return_ce_loss=True, return_ce_k=False)
+                if batch_loss is None:
+                    raise RuntimeError("validation requires ce_loss")
                 batch_loss = batch_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -318,7 +320,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,final_resid_mix,final_resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -753,8 +755,6 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.triangular = LowerTriangularLinear(model_dim, model_dim, bias=False)
 
-        self.final_resid_mix = nn.Parameter(torch.stack((torch.ones(model_dim), torch.zeros(model_dim))).float())
-
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -783,7 +783,13 @@ class GPT(nn.Module):
             if isinstance(module, LowerTriangularLinear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.packed_weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        return_ce_loss: bool = True,
+        return_ce_k: bool = True,
+    ) -> tuple[Tensor | None, Tensor | None]:
         x = self.tok_emb(input_ids)
         x = self.triangular(x)
         x = F.rms_norm(x, (x.size(-1),))
@@ -799,7 +805,6 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_resid_mix[0][None, None, :] * x + self.final_resid_mix[1][None, None, :] * x0
         x = self.final_norm(x)
         targets = target_ids
         if self.tie_embeddings:
@@ -809,16 +814,27 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction="mean")
-        return ce_loss, ce_k_loss(logits, targets)
+        return compute_losses(logits, targets, return_ce_loss=return_ce_loss, return_ce_k=return_ce_k)
 
-def ce_k_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 5.0) -> torch.Tensor:
+def compute_losses(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    return_ce_loss: bool = True,
+    return_ce_k: bool = True,
+    alpha: float = 5.0,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not return_ce_loss and not return_ce_k:
+        return None, None
+    logits = logits.float()
     B, T, V = logits.shape
     losses = F.cross_entropy(
         logits.view(-1, V),
         targets.view(-1),
         reduction="none",
     )
+    ce_loss = losses.mean() if return_ce_loss else None
+    if not return_ce_k:
+        return ce_loss, None
     # per-token losses (B, T)
     per_token_losses = losses.view(B, T)
     # Apply weights per time step before reducing
@@ -827,7 +843,7 @@ def ce_k_loss(logits: torch.Tensor, targets: torch.Tensor, alpha: float = 5.0) -
     
     weighted_losses = per_token_losses * weights
     per_sample_losses = weighted_losses.mean(dim=1)
-    return per_sample_losses.mean()
+    return ce_loss, per_sample_losses.mean()
 
 def make_weights(T: int, c: float, p: float, device=None, dtype=torch.float32):
     assert T >= 2, "Need T>=2 so (T-1) is nonzero."
@@ -1089,7 +1105,9 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    _, warmup_ce_k_loss = model(x, y)
+                    _, warmup_ce_k_loss = model(x, y, return_ce_loss=False, return_ce_k=True)
+                    if warmup_ce_k_loss is None:
+                        raise RuntimeError("warmup requires ce_k loss")
                 (warmup_ce_k_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1150,17 +1168,28 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        next_step = step + 1
+        should_log_train = (
+            args.train_log_every > 0
+            and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
+        )
         zero_grad_all()
-        train_loss = torch.zeros((), device=device)
+        train_loss = torch.zeros((), device=device) if should_log_train else None
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                ce_loss, ce_k = model(x, y)
-            train_loss += ce_loss.detach()
+                ce_loss, ce_k = model(x, y, return_ce_loss=should_log_train, return_ce_k=True)
+                if ce_k is None:
+                    raise RuntimeError("training requires ce_k loss")
+            if train_loss is not None:
+                if ce_loss is None:
+                    raise RuntimeError("train logging requires ce_loss")
+                train_loss += ce_loss.detach()
             (ce_k * grad_scale).backward()
-        train_loss /= grad_accum_steps
+        if train_loss is not None:
+            train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1179,10 +1208,6 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
