@@ -57,7 +57,7 @@ fi
 
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export RUN_ID
-export SEED="${SEED:-1337}"
+export SEED="${SEED:-2000}"
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
