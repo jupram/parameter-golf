@@ -73,6 +73,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    aux_loss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", 0.1))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -284,7 +285,8 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                _, batch_loss, _ = model(x, y, return_components=True)
+                batch_loss = batch_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -672,6 +674,54 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
+class AuxNet(nn.Module):
+    # Auxilary net with 2 Block layers that takes in Embeddings 
+    # and outputs hidden states for editing the hidden state fo the main LM.
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+        self.input_norm = RMSNorm()
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(2)
+            ]
+        )
+        self.output_norm = RMSNorm()
+        # Start as a no-op editor until training learns a useful residual edit.
+        self.edit_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.space_head = CastedLinear(dim, 1, bias=False)
+        self.space_head._zero_init = True
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
+
+    def forward(self, embeddings: Tensor) -> tuple[Tensor, Tensor]:
+        x = self.input_norm(embeddings)
+        x0 = x
+        for block in self.blocks:
+            x = block(x, x0)
+        x = self.output_norm(x)
+        edit = self.edit_scale.to(dtype=x.dtype)[None, None, :] * x
+        space_logits = self.space_head(x).squeeze(-1)
+        return edit, space_logits
 
 class GPT(nn.Module):
     def __init__(
@@ -687,14 +737,27 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        has_leading_space_lut: Tensor,
+        aux_loss_weight: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if aux_loss_weight < 0.0:
+            raise ValueError(f"aux_loss_weight must be non-negative, got {aux_loss_weight}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.aux_loss_weight = aux_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.aux_net = AuxNet(
+            model_dim,
+            num_heads,
+            num_kv_heads,
+            mlp_mult,
+            rope_base,
+            qk_gain_init,
+        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -714,6 +777,7 @@ class GPT(nn.Module):
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.register_buffer("has_leading_space_lut", has_leading_space_lut.to(dtype=torch.bool), persistent=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -725,9 +789,10 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, return_components: bool = False) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        aux_edit, aux_logits = self.aux_net(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -740,6 +805,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
+        x = x + aux_edit
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -749,7 +815,13 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        lm_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        aux_targets = self.has_leading_space_lut[target_ids].to(dtype=aux_logits.dtype)
+        aux_loss = F.binary_cross_entropy_with_logits(aux_logits.float(), aux_targets.float(), reduction="mean")
+        total_loss = lm_loss + self.aux_loss_weight * aux_loss
+        if return_components:
+            return total_loss, lm_loss, aux_loss
+        return total_loss
 
 
 # -----------------------------
@@ -873,6 +945,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        has_leading_space_lut=has_leading_space_lut,
+        aux_loss_weight=args.aux_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -886,19 +960,21 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    body_named_params = [
+        (name, p)
+        for name, p in base_model.named_parameters()
+        if name not in {"tok_emb.weight", "lm_head.weight"}
+    ]
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in body_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in body_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -940,7 +1016,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} aux_loss_weight:{args.aux_loss_weight}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
