@@ -704,8 +704,12 @@ class AuxNet(nn.Module):
         self.output_norm = RMSNorm()
         # Start as a no-op editor until training learns a useful residual edit.
         self.edit_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-        self.space_head = CastedLinear(dim, 1, bias=False)
-        self.space_head._zero_init = True
+        self.space_head = nn.Sequential(
+            CastedLinear(dim, dim, bias=False),
+            nn.ReLU(),
+            CastedLinear(dim, 1, bias=False),
+        )
+        self.space_head[-1]._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
