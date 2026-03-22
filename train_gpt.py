@@ -73,6 +73,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    lm_head_rank = int(os.environ.get("LM_HEAD_RANK", 128))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -284,10 +285,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, _ = model(x, y, return_ce_loss=True, return_ce_k=False)
-                if batch_loss is None:
-                    raise RuntimeError("validation requires ce_loss")
-                batch_loss = batch_loss.detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -595,6 +593,50 @@ class LowerTriangularLinear(nn.Module):
         return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
 
 
+class LowRankTransform(nn.Module):
+    # Factorize a large linear layer into two smaller matrices.
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        bias: bool = False,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"rank must be positive, got {rank}")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.factor_in = nn.Parameter(torch.empty(rank, in_features, device=device, dtype=dtype))
+        self.factor_out = nn.Parameter(torch.empty(out_features, rank, device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.factor_in, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.factor_out, a=math.sqrt(5))
+        if self.bias is not None:
+            bound = 1 / math.sqrt(self.in_features) if self.in_features > 0 else 0.0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: Tensor) -> Tensor:
+        hidden = F.linear(x, self.factor_in.to(x.dtype))
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(hidden, self.factor_out.to(x.dtype), bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"rank={self.rank}, bias={self.bias is not None}"
+        )
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -739,6 +781,7 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        lm_head_rank: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -754,6 +797,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.triangular = LowerTriangularLinear(model_dim, model_dim, bias=False)
+        self.final_resid_mix = nn.Parameter(torch.stack((torch.ones(model_dim), torch.zeros(model_dim))).float())
 
         self.blocks = nn.ModuleList(
             [
@@ -769,7 +813,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.lm_head = None if tie_embeddings else LowRankTransform(model_dim, vocab_size, lm_head_rank, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -782,14 +826,14 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
             if isinstance(module, LowerTriangularLinear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.packed_weight)
+            if isinstance(module, LowRankTransform) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.factor_out)
 
     def forward(
         self,
         input_ids: Tensor,
         target_ids: Tensor,
-        return_ce_loss: bool = True,
-        return_ce_k: bool = True,
-    ) -> tuple[Tensor | None, Tensor | None]:
+    ) -> Tensor:
         x = self.tok_emb(input_ids)
         x = self.triangular(x)
         x = F.rms_norm(x, (x.size(-1),))
@@ -804,7 +848,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-
+        x = self.final_resid_mix[0][None, None, :] * x + self.final_resid_mix[1][None, None, :] * x0
         x = self.final_norm(x)
         targets = target_ids
         if self.tie_embeddings:
@@ -814,46 +858,10 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return compute_losses(logits, targets, return_ce_loss=return_ce_loss, return_ce_k=return_ce_k)
-
-def compute_losses(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    return_ce_loss: bool = True,
-    return_ce_k: bool = True,
-    alpha: float = 5.0,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    if not return_ce_loss and not return_ce_k:
-        return None, None
-    logits = logits.float()
-    B, T, V = logits.shape
-    losses = F.cross_entropy(
-        logits.view(-1, V),
-        targets.view(-1),
-        reduction="none",
-    )
-    ce_loss = losses.mean() if return_ce_loss else None
-    if not return_ce_k:
-        return ce_loss, None
-    # per-token losses (B, T)
-    per_token_losses = losses.view(B, T)
-    # Apply weights per time step before reducing
-    with torch.no_grad():
-        weights = make_weights(T, 0.5, p=1.2, device=losses.device, dtype=losses.dtype)
-    
-    weighted_losses = per_token_losses * weights
-    per_sample_losses = weighted_losses.mean(dim=1)
-    return ce_loss, per_sample_losses.mean()
-
-def make_weights(T: int, c: float, p: float, device=None, dtype=torch.float32):
-    assert T >= 2, "Need T>=2 so (T-1) is nonzero."
-    assert c > 0, "c must be > 0."
-    #assert p > 1, "p must be > 1 for 'more mass later' convex increase."
-    i = torch.arange(1, T + 1, device=device, dtype=dtype)  # 1..T
-    x = (i - 1) / (T - 1)                                   # 0..1
-    w = c + (1 - c) * (x ** p)
-    #return w  # shape: (T,)
-    return w.flip(0)  # shape: (T,)
+        return F.cross_entropy(
+            logits.float().view(-1, logits.size(-1)),
+            targets.view(-1),
+        )
 
 # -----------------------------
 # TRAINING
@@ -974,11 +982,12 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        lm_head_rank=args.lm_head_rank,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, (CastedLinear, LowerTriangularLinear)):
+        if isinstance(module, (CastedLinear, LowerTriangularLinear, LowRankTransform)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if compile_enabled else base_model
@@ -990,11 +999,13 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - packed lower-triangular params use MATRIX_LR via Adam (Muon expects 2D tensors)
     # - vectors/scalars use SCALAR_LR via Adam
+    head_named_params = list(base_model.lm_head.named_parameters(prefix="lm_head")) if base_model.lm_head is not None else []
     optim_named_params = (
         list(base_model.blocks.named_parameters())
         + list(base_model.triangular.named_parameters())
         + list(base_model.named_parameters(recurse=False))
     )
+    head_params = [p for _, p in head_named_params]
     packed_matrix_params = [p for name, p in optim_named_params if name.endswith("packed_weight")]
     matrix_params = [
         p
@@ -1041,7 +1052,7 @@ def main() -> None:
         optimizers.insert(2, optimizer_packed_matrix)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": head_params, "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -1105,10 +1116,8 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    _, warmup_ce_k_loss = model(x, y, return_ce_loss=False, return_ce_k=True)
-                    if warmup_ce_k_loss is None:
-                        raise RuntimeError("warmup requires ce_k loss")
-                (warmup_ce_k_loss * grad_scale).backward()
+                    warmup_loss = model(x, y)
+                (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -1180,14 +1189,10 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                ce_loss, ce_k = model(x, y, return_ce_loss=should_log_train, return_ce_k=True)
-                if ce_k is None:
-                    raise RuntimeError("training requires ce_k loss")
+                ce_loss = model(x, y)
             if train_loss is not None:
-                if ce_loss is None:
-                    raise RuntimeError("train logging requires ce_loss")
                 train_loss += ce_loss.detach()
-            (ce_k * grad_scale).backward()
+            (ce_loss * grad_scale).backward()
         if train_loss is not None:
             train_loss /= grad_accum_steps
 

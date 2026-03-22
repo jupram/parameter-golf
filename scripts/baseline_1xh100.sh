@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
 
 main() {
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,12 +56,15 @@ export RUN_ID
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024/}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
+export TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-0}"
+export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-200}"
 
 echo "Running baseline-style training on 1xH100"
 echo "RUN_ID=$RUN_ID"
 echo "DATA_PATH=$DATA_PATH"
 echo "TOKENIZER_PATH=$TOKENIZER_PATH"
 echo "VOCAB_SIZE=$VOCAB_SIZE"
+echo "TIE_EMBEDDINGS=$TIE_EMBEDDINGS"
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 }
 
