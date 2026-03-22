@@ -74,6 +74,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     aux_loss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", 0.1))
+    aux_dim = int(os.environ.get("AUX_DIM", 64))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -726,39 +727,32 @@ class Block(nn.Module):
         return x
 
 class AuxNet(nn.Module):
-    # Auxilary net with 2 Block layers that takes in Embeddings 
-    # and outputs hidden states for editing the hidden state fo the main LM.
+    # Small bottleneck editor for cheap serialized size.
     def __init__(
         self,
         dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
+        aux_dim: int,
     ):
         super().__init__()
+        if aux_dim <= 0:
+            raise ValueError(f"aux_dim must be positive, got {aux_dim}")
+        aux_dim = min(aux_dim, dim)
         self.input_norm = RMSNorm()
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for _ in range(2)
-            ]
+        self.down_proj = CastedLinear(dim, aux_dim, bias=False)
+        self.hidden_norm = RMSNorm()
+        self.editor = nn.Sequential(
+            CastedLinear(aux_dim, aux_dim, bias=False),
+            nn.ReLU(),
+            CastedLinear(aux_dim, aux_dim, bias=False),
         )
         self.output_norm = RMSNorm()
+        self.up_proj = CastedLinear(aux_dim, dim, bias=False)
         # Start as a no-op editor until training learns a useful residual edit.
         self.edit_scale = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         self.space_head = nn.Sequential(
-            CastedLinear(dim, dim, bias=False),
+            CastedLinear(aux_dim, aux_dim, bias=False),
             nn.ReLU(),
-            CastedLinear(dim, 1, bias=False),
+            CastedLinear(aux_dim, 1, bias=False),
         )
         self.space_head[-1]._zero_init = True
         self._init_weights()
@@ -769,12 +763,11 @@ class AuxNet(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, embeddings: Tensor) -> tuple[Tensor, Tensor]:
-        x = self.input_norm(embeddings)
-        x0 = x
-        for block in self.blocks:
-            x = block(x, x0)
-        x = self.output_norm(x)
-        edit = self.edit_scale.to(dtype=x.dtype)[None, None, :] * x
+        x = self.down_proj(self.input_norm(embeddings))
+        x = self.hidden_norm(x)
+        x = self.output_norm(x + self.editor(x))
+        edit_hidden = self.up_proj(x)
+        edit = self.edit_scale.to(dtype=edit_hidden.dtype)[None, None, :] * edit_hidden
         space_logits = self.space_head(x).squeeze(-1)
         return edit, space_logits
 
@@ -794,6 +787,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         has_leading_space_lut: Tensor,
         aux_loss_weight: float,
+        aux_dim: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -808,11 +802,7 @@ class GPT(nn.Module):
         self.triangular = LowerTriangularLinear(model_dim, model_dim, bias=False)
         self.aux_net = AuxNet(
             model_dim,
-            num_heads,
-            num_kv_heads,
-            mlp_mult,
-            rope_base,
-            qk_gain_init,
+            aux_dim,
         )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1007,6 +997,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         has_leading_space_lut=has_leading_space_lut,
         aux_loss_weight=args.aux_loss_weight,
+        aux_dim=args.aux_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, (CastedLinear, LowerTriangularLinear)):
@@ -1084,7 +1075,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} aux_loss_weight:{args.aux_loss_weight}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"aux_loss_weight:{args.aux_loss_weight} aux_dim:{args.aux_dim}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
