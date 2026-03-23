@@ -673,6 +673,51 @@ class Block(nn.Module):
         return x
 
 
+class GPTBranch(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for i in range(num_layers)
+            ]
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        x0 = x
+        skips: list[Tensor] = []
+
+        # First half stores skips; second half reuses them in reverse order.
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return x
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -691,25 +736,37 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if model_dim % 2 != 0:
+            raise ValueError(f"model_dim must be even for split branches, got {model_dim}")
+        branch_dim = model_dim // 2
+        if branch_dim % num_heads != 0:
+            raise ValueError(
+                f"split branch dim must be divisible by num_heads, got branch_dim={branch_dim} num_heads={num_heads}"
+            )
+        if (branch_dim // num_heads) % 2 != 0:
+            raise ValueError(
+                f"split branch head_dim must be even for RoPE, got branch_dim={branch_dim} num_heads={num_heads}"
+            )
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.branch_dim = branch_dim
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
+        self.branch_inputs = nn.ModuleList(
+            [CastedLinear(model_dim, self.branch_dim, bias=False) for _ in range(2)]
+        )
+        self.branches = nn.ModuleList(
             [
-                Block(
-                    model_dim,
+                GPTBranch(
+                    num_layers,
+                    self.branch_dim,
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for _ in range(2)
             ]
         )
         self.final_norm = RMSNorm()
@@ -728,17 +785,9 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x_left = self.branches[0](self.branch_inputs[0](x))
+        x_right = self.branches[1](self.branch_inputs[1](x))
+        x = torch.cat((x_left, x_right), dim=-1)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -886,19 +935,17 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    branch_named_params = list(base_model.branch_inputs.named_parameters()) + list(base_model.branches.named_parameters())
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in branch_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in branch_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -932,6 +979,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"architecture:dual_branch_projected model_dim:{args.model_dim} branch_dim:{base_model.branch_dim}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"sdp_backends:cudnn=False flash={use_flash_gqa} mem_efficient=False math={not use_flash_gqa}"
