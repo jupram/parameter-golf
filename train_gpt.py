@@ -317,7 +317,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,branch_mix",
     ).split(",")
     if pattern
 )
@@ -755,6 +755,9 @@ class GPT(nn.Module):
         self.branch_inputs = nn.ModuleList(
             [CastedLinear(model_dim, self.branch_dim, bias=False) for _ in range(2)]
         )
+        self.branch_outputs = nn.ModuleList(
+            [CastedLinear(self.branch_dim, model_dim, bias=False) for _ in range(2)]
+        )
         self.branches = nn.ModuleList(
             [
                 GPTBranch(
@@ -769,6 +772,7 @@ class GPT(nn.Module):
                 for _ in range(2)
             ]
         )
+        self.branch_mix = nn.Parameter(torch.full((2, model_dim), 0.5, dtype=torch.float32))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -785,9 +789,10 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x_left = self.branches[0](self.branch_inputs[0](x))
-        x_right = self.branches[1](self.branch_inputs[1](x))
-        x = torch.cat((x_left, x_right), dim=-1)
+        x_left = self.branch_outputs[0](self.branches[0](self.branch_inputs[0](x)))
+        x_right = self.branch_outputs[1](self.branches[1](self.branch_inputs[1](x)))
+        branch_mix = self.branch_mix.to(dtype=x_left.dtype)
+        x = branch_mix[0][None, None, :] * x_left + branch_mix[1][None, None, :] * x_right
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -936,7 +941,12 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    branch_named_params = list(base_model.branch_inputs.named_parameters()) + list(base_model.branches.named_parameters())
+    branch_named_params = (
+        list(base_model.branch_inputs.named_parameters())
+        + list(base_model.branch_outputs.named_parameters())
+        + list(base_model.branches.named_parameters())
+        + [("branch_mix", base_model.branch_mix)]
+    )
     matrix_params = [
         p
         for name, p in branch_named_params
