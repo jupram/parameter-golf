@@ -70,9 +70,13 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    # Gold-conditioned second-token auxiliary loss:
+    # lm_loss + SECOND_TOKEN_LOSS_WEIGHT * second_token_loss
+    second_token_loss_weight = float(os.environ.get("SECOND_TOKEN_LOSS_WEIGHT", 0.15))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -284,7 +288,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, include_aux=False).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -685,15 +689,19 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        second_token_loss_weight: float,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if second_token_loss_weight < 0.0:
+            raise ValueError(f"second_token_loss_weight must be non-negative, got {second_token_loss_weight}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.second_token_loss_weight = second_token_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -716,6 +724,8 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.second_cond_mod = CastedLinear(model_dim, 2 * model_dim, bias=False)
+        self.second_cond_out = CastedLinear(model_dim, model_dim, bias=False)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -725,7 +735,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _hidden_states(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -740,16 +750,56 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        return self.final_norm(x)
+
+    def _project_vocab(self, x: Tensor) -> Tensor:
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            return F.linear(x, self.tok_emb.weight)
+        if self.lm_head is None:
+            raise RuntimeError("lm_head is required when tie_embeddings=False")
+        return self.lm_head(x)
+
+    def _softcap_logits(self, logits_proj: Tensor) -> Tensor:
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return logits
+
+    def _next_token_logits(self, hidden_states: Tensor) -> Tensor:
+        return self._softcap_logits(self._project_vocab(hidden_states))
+
+    def _next_token_loss(self, logits: Tensor, target_ids: Tensor) -> Tensor:
+        x = logits.reshape(-1, logits.size(-1))
+        targets = target_ids.reshape(-1)
+        return F.cross_entropy(x.float(), targets, reduction="mean")
+
+    def _gold_conditioned_second_token_loss(self, hidden_states: Tensor, target_ids: Tensor) -> Tensor:
+        if hidden_states.size(1) < 3:
+            return torch.zeros((), device=hidden_states.device, dtype=torch.float32)
+        h = hidden_states[:, :-2, :]
+        y1 = target_ids[:, :-2]
+        y2 = target_ids[:, 1:-1]
+        gold_emb = self.tok_emb(y1)
+        gate, shift = self.second_cond_mod(gold_emb).chunk(2, dim=-1)
+        conditioned = h * (1.0 + torch.tanh(gate)) + shift
+        g = self.second_cond_out(F.gelu(conditioned))
+        second_logits = self._softcap_logits(F.linear(g, self.tok_emb.weight))
+        return F.cross_entropy(second_logits.reshape(-1, second_logits.size(-1)).float(), y2.reshape(-1), reduction="mean")
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        include_aux: bool = True,
+        return_lm_loss: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        hidden_states = self._hidden_states(input_ids)
+        first_logits = self._next_token_logits(hidden_states)
+        lm_loss = self._next_token_loss(first_logits, target_ids)
+        loss = lm_loss
+        if include_aux and self.second_token_loss_weight > 0.0:
+            loss = loss + self.second_token_loss_weight * self._gold_conditioned_second_token_loss(hidden_states, target_ids)
+        if return_lm_loss:
+            return loss, lm_loss
+        return loss
 
 
 # -----------------------------
@@ -871,6 +921,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        second_token_loss_weight=args.second_token_loss_weight,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
@@ -887,11 +938,16 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    aux_matrix_params = [
+        base_model.second_cond_mod.weight,
+        base_model.second_cond_out.weight,
+    ]
     matrix_params = [
         p
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_params.extend(aux_matrix_params)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -920,10 +976,13 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    head_params: list[Tensor] = []
     if base_model.lm_head is not None:
+        head_params.append(base_model.lm_head.weight)
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if head_params:
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": head_params, "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -939,7 +998,7 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"head_lr:{args.head_lr} second_token_loss_weight:{args.second_token_loss_weight} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
@@ -987,7 +1046,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss, _ = model(x, y, return_lm_loss=True)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1055,8 +1114,8 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
+                loss, lm_loss = model(x, y, return_lm_loss=True)
+            train_loss += lm_loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
