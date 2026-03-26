@@ -55,6 +55,7 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", "-1"))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -1004,6 +1005,7 @@ def main() -> None:
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"warmdown_iters:{args.warmdown_iters} warmdown_frac:{args.warmdown_frac:.6f} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     if args.val_max_tokens > 0:
@@ -1021,15 +1023,26 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    if args.warmdown_frac >= 0.0:
+        warmdown_frac = min(args.warmdown_frac, 1.0)
+    elif args.warmdown_iters > 0:
+        warmdown_frac = min(args.warmdown_iters / max(args.iterations, 1), 1.0)
+    else:
+        warmdown_frac = 0.0
+    warmdown_iters = max(int(round(args.iterations * warmdown_frac)), 0)
+    warmdown_mode = "wallclock" if max_wallclock_ms is not None else "iterations"
+    log0(
+        f"warmdown_schedule:mode:{warmdown_mode} effective_warmdown_frac:{warmdown_frac:.6f} "
+        f"effective_warmdown_iters:{warmdown_iters}"
+    )
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        if warmdown_frac <= 0.0:
             return 1.0
         if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
+            warmdown_start = max(args.iterations - warmdown_iters, 0)
+            return max((args.iterations - step) / max(warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        warmdown_ms = max_wallclock_ms * warmdown_frac
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
