@@ -29,6 +29,9 @@ reset_runtime_env() {
   unset DATA_PATH
   unset TOKENIZER_PATH
   unset VOCAB_SIZE
+  unset TIE_EMBEDDINGS
+  unset VAL_LOSS_EVERY
+  unset SEED
 }
 
 reset_runtime_env
@@ -58,6 +61,7 @@ export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.mode
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
 export TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
 export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-200}"
+export SEED="${SEED:-42}"
 
 echo "Running baseline-style training on 1xH100"
 echo "RUN_ID=$RUN_ID"
@@ -65,6 +69,7 @@ echo "DATA_PATH=$DATA_PATH"
 echo "TOKENIZER_PATH=$TOKENIZER_PATH"
 echo "VOCAB_SIZE=$VOCAB_SIZE"
 echo "TIE_EMBEDDINGS=$TIE_EMBEDDINGS"
+echo "SEED=$SEED"
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 }
 

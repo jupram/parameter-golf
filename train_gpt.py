@@ -981,6 +981,16 @@ def main() -> None:
         f"effective_warmdown_iters:{warmdown_iters}"
     )
 
+    def warmdown_active(step: int, elapsed_ms: float) -> bool:
+        if warmdown_frac <= 0.0:
+            return False
+        if max_wallclock_ms is None:
+            warmdown_start = max(args.iterations - warmdown_iters, 0)
+            return warmdown_start <= step < args.iterations
+        warmdown_ms = max_wallclock_ms * warmdown_frac
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining_ms <= warmdown_ms
+
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if warmdown_frac <= 0.0:
             return 1.0
@@ -1025,6 +1035,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    warmdown_logged = False
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1064,6 +1075,9 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if not warmdown_logged and warmdown_active(step, elapsed_ms):
+            log0(f"warmdown_start:step:{step}/{args.iterations} elapsed_ms:{elapsed_ms:.0f} mode:{warmdown_mode}")
+            warmdown_logged = True
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)

@@ -108,6 +108,17 @@ class Hyperparameters:
     def microbatch_tokens(self) -> int:
         return self.train_batch_tokens // self.grad_accum_steps
 
+    def warmdown_active(self, step: int, elapsed_ms: float) -> bool:
+        if self.warmdown_iters <= 0:
+            return False
+        if self.max_wallclock_seconds <= 0:
+            warmdown_start = max(self.iterations - self.warmdown_iters, 0)
+            return warmdown_start <= step < self.iterations
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = self.warmdown_iters * step_ms
+        remaining_ms = max(1000.0 * self.max_wallclock_seconds - elapsed_ms, 0.0)
+        return remaining_ms <= warmdown_ms
+
     def lr_mul(self, step: int, elapsed_ms: float) -> float:
         if self.warmdown_iters <= 0:
             return 1.0
@@ -998,6 +1009,7 @@ def main() -> None:
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
+    warmdown_logged = False
     t0 = time.perf_counter()
     step = 0
     while True:
@@ -1025,7 +1037,12 @@ def main() -> None:
                 log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}")
             break
 
-        lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
+        elapsed_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if not warmdown_logged and args.warmdown_active(step, elapsed_ms):
+            warmdown_mode = "wallclock" if max_wallclock_ms is not None else "iterations"
+            log(f"warmdown_start:step:{step}/{args.iterations} elapsed_ms:{elapsed_ms:.0f} mode:{warmdown_mode}")
+            warmdown_logged = True
+        lr_mul = args.lr_mul(step, elapsed_ms)
         step_t0 = time.perf_counter()
 
         accum: dict[str, mx.array] | None = None
