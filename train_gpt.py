@@ -69,6 +69,8 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
+    lambda_norm = float(os.environ.get("LAMBDA_NORM", 0.01))
+    log_norm_target = float(os.environ.get("LOG_NORM_TARGET", math.log(1.2) +0.5 * math.log(model_dim)))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -285,7 +287,9 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                # Validation reports plain LM loss; the auxiliary norm penalty is training-only.
+                _, batch_loss = model(x, y, lambda_norm=0.0)
+                batch_loss = batch_loss.detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -674,6 +678,11 @@ class Block(nn.Module):
         return x
 
 
+def log_norm_target_loss(z: Tensor, target: float = 0.0, eps: float = 1e-8) -> Tensor:
+    log_norms = torch.log(torch.linalg.vector_norm(z.float(), dim=-1) + eps)
+    return (log_norms.mean(dim=1) - target).square().mean()
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -726,7 +735,13 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        lambda_norm: float = 0.0,
+        log_norm_target: float = 0.0,
+    ) -> tuple[Tensor, Tensor]:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -741,7 +756,10 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        z = x  # Save pre-final-norm activations for the auxiliary log-norm penalty.
+        x = self.final_norm(x)
+        x = x.reshape(-1, x.size(-1))
+
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -750,7 +768,12 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        lm_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if lambda_norm == 0.0:
+            return lm_loss, lm_loss
+        aux_loss = log_norm_target_loss(z, target=log_norm_target)
+        loss = lm_loss + lambda_norm * aux_loss
+        return loss, lm_loss
 
 
 # -----------------------------
@@ -943,6 +966,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(f"lambda_norm:{args.lambda_norm} log_norm_target:{args.log_norm_target}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1000,7 +1024,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss, _ = model(x, y, lambda_norm=args.lambda_norm, log_norm_target=args.log_norm_target)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1068,8 +1092,8 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
+                loss, lm_loss = model(x, y, lambda_norm=args.lambda_norm, log_norm_target=args.log_norm_target)
+            train_loss += lm_loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
