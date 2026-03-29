@@ -77,7 +77,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     # Gold-conditioned second-token auxiliary loss:
     # lm_loss + SECOND_TOKEN_LOSS_WEIGHT * second_token_loss
-    second_token_loss_weight = float(os.environ.get("SECOND_TOKEN_LOSS_WEIGHT", 0.15))
+    second_token_loss_weight = float(os.environ.get("SECOND_TOKEN_LOSS_WEIGHT", 0.8))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
