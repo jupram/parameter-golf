@@ -680,7 +680,7 @@ class Block(nn.Module):
 
 def log_norm_target_loss(z: Tensor, target: float = 0.0, eps: float = 1e-8) -> Tensor:
     log_norms = torch.log(torch.linalg.vector_norm(z.float(), dim=-1) + eps)
-    return (log_norms.mean(dim=1) - target).square().mean()
+    return (log_norms - target).square().mean()
 
 
 class GPT(nn.Module):
