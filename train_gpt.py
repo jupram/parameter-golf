@@ -32,7 +32,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 # Default Simple Baseline run:
-# - 9 transformer blocks at width 512
+# - 6 transformer blocks at width 512
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
@@ -66,11 +66,13 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 6))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    recurrent_group_size = int(os.environ.get("RECURRENT_GROUP_SIZE", 3))
+    edit_hidden_dim = int(os.environ.get("EDIT_HIDDEN_DIM", str(max(16, model_dim // 4))))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -646,6 +648,22 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class EditNetwork(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        if hidden_dim <= 0:
+            raise ValueError(f"edit_hidden_dim must be positive, got {hidden_dim}")
+        self.norm = RMSNorm()
+        self.fc = CastedLinear(dim, hidden_dim, bias=False)
+        self.proj = CastedLinear(hidden_dim, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x)
+        x = F.silu(self.fc(x))
+        return self.proj(x)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -683,6 +701,8 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        recurrent_group_size: int,
+        edit_hidden_dim: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -692,9 +712,18 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if recurrent_group_size <= 0:
+            raise ValueError(f"recurrent_group_size must be positive, got {recurrent_group_size}")
+        if num_layers % recurrent_group_size != 0:
+            raise ValueError(
+                f"num_layers ({num_layers}) must be divisible by recurrent_group_size ({recurrent_group_size})"
+            )
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.recurrent_group_size = recurrent_group_size
+        self.num_recurrent_groups = num_layers // recurrent_group_size
+        self.edit_hidden_dim = edit_hidden_dim
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList(
             [
@@ -708,6 +737,12 @@ class GPT(nn.Module):
                 )
                 for i in range(num_layers)
             ]
+        )
+        self.group_editors = nn.ModuleList(
+            [EditNetwork(model_dim, edit_hidden_dim) for _ in range(self.num_recurrent_groups)]
+        )
+        self.edit_scales = nn.ParameterList(
+            [nn.Parameter(torch.ones(model_dim, dtype=torch.float32)) for _ in range(self.num_recurrent_groups)]
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -727,8 +762,21 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        for block in self.blocks:
-            x = block(x, x0)
+        for group_idx in range(self.num_recurrent_groups):
+            group_start = group_idx * self.recurrent_group_size
+            group_input = x
+            first_pass = group_input
+            for block_offset in range(self.recurrent_group_size):
+                first_pass = self.blocks[group_start + block_offset](first_pass, x0)
+
+            # Use the first-pass delta as the edit signal, then gate the correction per channel.
+            delta = first_pass - group_input
+            edit = self.group_editors[group_idx](delta)
+            edit_scale = self.edit_scales[group_idx].to(dtype=edit.dtype)[None, None, :]
+            second_pass = group_input + edit_scale * edit
+            for block_offset in range(self.recurrent_group_size):
+                second_pass = self.blocks[group_start + block_offset](second_pass, x0)
+            x = second_pass
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -858,6 +906,8 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        recurrent_group_size=args.recurrent_group_size,
+        edit_hidden_dim=args.edit_hidden_dim,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -874,17 +924,21 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - matrix params in the recurrent transformer core use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    core_named_params = [
+        (name, p)
+        for name, p in base_model.named_parameters()
+        if name not in {"tok_emb.weight", "lm_head.weight"}
+    ]
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in core_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in core_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -925,6 +979,10 @@ def main() -> None:
         f"sdp_backends:cudnn=False flash={use_flash_gqa} mem_efficient=False math={not use_flash_gqa}"
     )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"recurrent_group_size:{base_model.recurrent_group_size} "
+        f"recurrent_groups:{base_model.num_recurrent_groups} edit_hidden_dim:{base_model.edit_hidden_dim}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
