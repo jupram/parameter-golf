@@ -74,6 +74,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    embed_near_zero_threshold = float(os.environ.get("EMBED_NEAR_ZERO_THRESHOLD", 0.01))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -535,6 +536,34 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class NearZeroChannelPool(nn.Module):
+    def __init__(self, threshold: float):
+        super().__init__()
+        if threshold < 0.0:
+            raise ValueError(f"threshold must be non-negative, got {threshold}")
+        self.threshold = threshold
+
+    def forward(self, x: Tensor) -> Tensor:
+        flat = x.reshape(-1, x.size(-1))
+        near_zero_mask = flat.abs() <= self.threshold
+        active = near_zero_mask.any(dim=-1, keepdim=True)
+        if not torch.any(active):
+            return x
+
+        mask_f = near_zero_mask.to(dtype=flat.dtype)
+        pooled = flat.masked_fill(near_zero_mask, 0.0)
+        chosen_scores = torch.rand(flat.shape, device=flat.device, dtype=torch.float32)
+        chosen_scores = chosen_scores.masked_fill(~near_zero_mask, -1.0)
+        chosen_idx = chosen_scores.argmax(dim=-1, keepdim=True)
+        active_sum = (flat * mask_f).sum(dim=-1, keepdim=True)
+        pooled_update = (active_sum * active.to(dtype=flat.dtype)).to(dtype=pooled.dtype)
+        pooled.scatter_add_(1, chosen_idx, pooled_update)
+        pooled = pooled.reshape_as(x)
+        # Straight-through estimator: use pooled values in forward, identity in backward.
+        return x + (pooled - x).detach()
+    
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
@@ -686,6 +715,7 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        embed_near_zero_threshold: float,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -697,6 +727,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb_even = nn.Embedding(vocab_size, model_dim)
         self.tok_emb_odd = nn.Embedding(vocab_size, model_dim)
+        self.embed_near_zero_pool = NearZeroChannelPool(embed_near_zero_threshold)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -742,6 +773,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.embed_tokens(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        x = self.embed_near_zero_pool(x)
+        
         x0 = x
         skips: list[Tensor] = []
 
@@ -885,6 +918,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        embed_near_zero_threshold=args.embed_near_zero_threshold,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
@@ -954,7 +988,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"embed_near_zero_threshold:{args.embed_near_zero_threshold}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
