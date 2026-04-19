@@ -74,6 +74,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    logit_margin = float(os.environ.get("LOGIT_MARGIN", 0.0))
+    logit_margin_loss_weight = float(os.environ.get("LOGIT_MARGIN_LOSS_WEIGHT", 1.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -686,15 +688,23 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        logit_margin: float,
+        logit_margin_loss_weight: float,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if logit_margin < 0.0:
+            raise ValueError(f"logit_margin must be non-negative, got {logit_margin}")
+        if logit_margin_loss_weight < 0.0:
+            raise ValueError(f"logit_margin_loss_weight must be non-negative, got {logit_margin_loss_weight}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.logit_margin = logit_margin
+        self.logit_margin_loss_weight = logit_margin_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -726,7 +736,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -742,15 +752,28 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        targets = target_ids.reshape(-1)
+        logits = self.forward_logits(input_ids)
+        logits_float = logits.float()
+        main_loss = F.cross_entropy(logits_float, targets, reduction="mean")
+
+        if self.training and self.logit_margin_loss_weight > 0.0:
+            target_logits = logits_float.gather(1, targets[:, None])
+            margin_violations = F.relu(self.logit_margin - (target_logits - logits_float))
+            num_other_logits = max(logits_float.size(1) - 1, 1)
+            margin_loss = (margin_violations.sum(dim=1) - self.logit_margin).mean() / num_other_logits
+            main_loss = main_loss + self.logit_margin_loss_weight * margin_loss
+
+        return main_loss
 
 
 # -----------------------------
@@ -872,6 +895,8 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        logit_margin=args.logit_margin,
+        logit_margin_loss_weight=args.logit_margin_loss_weight,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
@@ -938,6 +963,10 @@ def main() -> None:
         f"sdp_backends:cudnn=False flash={use_flash_gqa} mem_efficient=False math={not use_flash_gqa}"
     )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"logit_margin:{args.logit_margin} "
+        f"logit_margin_loss_weight:{args.logit_margin_loss_weight}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
